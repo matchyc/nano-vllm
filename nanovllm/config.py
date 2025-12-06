@@ -16,6 +16,16 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # Sparse attention configuration
+    use_sparse_attention: bool = False
+    sparse_topk: int = 64
+    sparse_min_seq_len: int = 512
+    sparse_distance_metric: str = "ip"  # "ip" or "l2"
+    sparse_index_granularity: str = "layer_shared"  # "layer_shared" or "per_head"
+    # MLANN build parameters
+    sparse_mlann_n_trees: int = 10
+    sparse_mlann_depth: int = 6
+    sparse_mlann_votes_required: int = 5
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
