@@ -43,6 +43,31 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## Prototype Sparse Attention (Experimental)
+
+Nano-vLLM now includes an exploratory sparse-attention path that relies on MLANN indices built from prefill keys. It is **single GPU only** and currently limits sparse lookups to prefill tokens (decode tokens are always attended densely over a short window).
+
+Enable it by passing additional config fields when instantiating `LLM`:
+
+```python
+llm = LLM(
+    "/YOUR/MODEL/PATH",
+    use_sparse_attention=True,
+    sparse_topk=64,
+    sparse_min_seq_len=512,
+    sparse_distance_metric="ip",
+    sparse_decode_dense_window=128,
+)
+```
+
+Troubleshooting tips:
+
+- Set `NANOVLLM_DISABLE_SPARSE_ATTENTION=1` to force the dense path at runtime.
+- MLANN is optional. If its native extension is unavailable, the engine falls back to a naive CPU indexer.
+- The current prototype only supports `sparse_index_granularity="layer_shared"`. Per-head indices are left as a future extension.
+
+To compare latency with and without the sparse path on your hardware, use `python sparse_bench.py --model /path/to/Qwen3-0.6B --batch-size 4 --decode-tokens 64`.
+
 ## Benchmark
 
 See `bench.py` for benchmark.

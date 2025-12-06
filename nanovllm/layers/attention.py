@@ -55,12 +55,20 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.sparse_manager = None
+        self.layer_id = -1
+
+    def attach_sparse_manager(self, manager, layer_id: int):
+        self.sparse_manager = manager
+        self.layer_id = layer_id
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        if self.sparse_manager is not None and context.is_prefill:
+            self.sparse_manager.on_prefill(self.layer_id, context, k)
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
@@ -69,7 +77,11 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
+            if self.sparse_manager is not None:
+                sparse_out = self.sparse_manager.try_decode(self.layer_id, q, k_cache, v_cache, context)
+                if sparse_out is not None:
+                    return sparse_out
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True)
         return o
