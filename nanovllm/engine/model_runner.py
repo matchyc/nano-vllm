@@ -8,8 +8,10 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.attention import Attention
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.sparse.index_manager import SparseIndexManager
 
 
 class ModelRunner:
@@ -33,6 +35,12 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
+        
+        # Initialize sparse attention index manager
+        self.index_manager = SparseIndexManager(config) if config.use_sparse_attention else None
+        if self.index_manager is not None:
+            self._setup_attention_layers()
+        
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -115,6 +123,16 @@ class ModelRunner:
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                layer_id += 1
+    
+    def _setup_attention_layers(self):
+        """Set up layer_id and index_manager for all Attention layers."""
+        layer_id = 0
+        for module in self.model.modules():
+            if isinstance(module, Attention):
+                # Found an Attention layer
+                module.layer_id = layer_id
+                module.index_manager = self.index_manager
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
@@ -206,12 +224,44 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # Clear indices for new prefill batch
+        if is_prefill and self.index_manager is not None:
+            self.index_manager.clear_indices()
+        
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
+        
+        # Build indices after prefill completes
+        if is_prefill and self.index_manager is not None:
+            self._build_indices_after_prefill(seqs)
+        
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+    
+    def _build_indices_after_prefill(self, seqs: list[Sequence]):
+        """
+        Build ANN indices for all layers after prefill completes.
+        
+        In v1, this runs synchronously. Future versions can overlap
+        index building with computation of later layers.
+        """
+        if not self.index_manager or not self.index_manager.use_sparse:
+            return
+        
+        hf_config = self.config.hf_config
+        num_layers = hf_config.num_hidden_layers
+        
+        # Build indices for each layer
+        # TODO: In future, this can be overlapped with later layer computation
+        for layer_id in range(num_layers):
+            self.index_manager.build_indices_for_layer(
+                layer_id,
+                self.kv_cache,
+                seqs,
+                self.block_size,
+            )
 
     @torch.inference_mode()
     def capture_cudagraph(self):
