@@ -23,8 +23,10 @@ class Config:
     sparse_distance_metric: str = "ip"
     sparse_index_granularity: str = "layer_shared"
     sparse_decode_dense_window: int = 128
-    sparse_index_num_trees: int = 4
-    sparse_index_depth: int = 6
+    sparse_ann_mode: str = "exact"
+    sparse_ivf_num_lists: int = 64
+    sparse_ivf_num_probe: int = 4
+    sparse_ivf_max_iters: int = 6
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -41,6 +43,11 @@ class Config:
             assert self.tensor_parallel_size == 1, "Sparse attention v1 only supports tensor_parallel_size == 1"
             assert self.sparse_index_granularity in {"layer_shared", "per_head"}
             assert self.sparse_distance_metric in {"ip", "l2"}
+            assert self.sparse_ann_mode in {"exact", "ivf"}
             assert self.sparse_topk > 0
             assert self.sparse_min_seq_len >= self.sparse_topk
             assert self.sparse_decode_dense_window >= 0
+            if self.sparse_ann_mode == "ivf":
+                assert self.sparse_ivf_num_lists > 0
+                assert self.sparse_ivf_num_probe > 0
+                assert self.sparse_ivf_max_iters > 0

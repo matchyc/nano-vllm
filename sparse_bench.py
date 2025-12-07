@@ -14,6 +14,9 @@ def run_once(args, use_sparse: bool):
         sparse_min_seq_len=args.min_seq_len,
         sparse_distance_metric=args.metric,
         sparse_decode_dense_window=args.decode_window,
+        sparse_ann_mode=args.sparse_ann_mode,
+        sparse_ivf_num_lists=args.sparse_ivf_num_lists,
+        sparse_ivf_num_probe=args.sparse_ivf_num_probe,
     )
     prompts = [args.prompt] * args.batch_size
     sampling = SamplingParams(max_tokens=args.decode_tokens, temperature=0.0, ignore_eos=True)
@@ -37,6 +40,9 @@ def parse_args():
     parser.add_argument("--min-seq-len", type=int, default=512)
     parser.add_argument("--decode-window", type=int, default=128)
     parser.add_argument("--metric", choices=["ip", "l2"], default="ip")
+    parser.add_argument("--sparse-ann-mode", choices=["exact", "ivf"], default="exact")
+    parser.add_argument("--sparse-ivf-num-lists", type=int, default=64)
+    parser.add_argument("--sparse-ivf-num-probe", type=int, default=4)
     parser.add_argument("--enforce-eager", action="store_true")
     return parser.parse_args()
 

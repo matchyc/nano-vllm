@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 
-from .mlann_index import MLANNIndex
+from .ann_index import ANNIndex
 from .ops import sparse_subset_attention
 
 logger = logging.getLogger("nanovllm.sparse.runtime")
@@ -24,13 +24,15 @@ class LayerSequenceState:
     num_kv_heads: int
     head_dim: int
     metric: str
-    n_trees: int
-    depth: int
+    ann_mode: str
+    ivf_num_lists: int
+    ivf_num_probe: int
+    ivf_max_iters: int
     topk: int
     key_chunks: list[np.ndarray] = field(default_factory=list)
     slot_chunks: list[torch.Tensor] = field(default_factory=list)
     prefill_slots: torch.Tensor | None = None
-    index: MLANNIndex | None = None
+    index: ANNIndex | None = None
     collected_len: int = 0
     prefill_len: int = 0
     build_latency_ms: float = 0.0
@@ -53,15 +55,20 @@ class LayerSequenceState:
         corpus = np.concatenate(self.key_chunks, axis=0)
         self.prefill_slots = torch.cat(self.slot_chunks, dim=0)
         self.prefill_len = int(self.prefill_slots.numel())
-        training_k = min(max(self.topk * 2, 32), self.prefill_len)
-        index = MLANNIndex(metric=metric, n_trees=self.n_trees, depth=self.depth, training_k=training_k)
+        index = ANNIndex(
+            metric=metric,
+            mode=self.ann_mode,
+            ivf_num_lists=self.ivf_num_lists,
+            ivf_num_probe=self.ivf_num_probe,
+            ivf_max_iters=self.ivf_max_iters,
+        )
         t0 = perf_counter()
         index.build(corpus)
         self.build_latency_ms = (perf_counter() - t0) * 1000
         self.index = index
         self.key_chunks.clear()
         self.slot_chunks.clear()
-        logger.info("Built MLANN index: seq=%d tokens=%d latency=%.2fms", self.seq_id, self.prefill_len, self.build_latency_ms)
+        logger.info("Built ANN index: seq=%d tokens=%d latency=%.2fms", self.seq_id, self.prefill_len, self.build_latency_ms)
         return True
 
     def query(self, q_vector: torch.Tensor, k: int) -> torch.Tensor:
@@ -85,8 +92,10 @@ class SparseAttentionManager:
         self.min_seq_len = config.sparse_min_seq_len
         self.granularity = config.sparse_index_granularity
         self.decode_window = config.sparse_decode_dense_window
-        self.n_trees = config.sparse_index_num_trees
-        self.depth = config.sparse_index_depth
+        self.ann_mode = config.sparse_ann_mode
+        self.ivf_num_lists = config.sparse_ivf_num_lists
+        self.ivf_num_probe = config.sparse_ivf_num_probe
+        self.ivf_max_iters = config.sparse_ivf_max_iters
         self.num_layers = hf_config.num_hidden_layers
         self.layer_states: List[Dict[int, LayerSequenceState]] = [dict() for _ in range(self.num_layers)]
         self.layer_meta: Dict[int, dict] = {}
@@ -163,8 +172,10 @@ class SparseAttentionManager:
                 num_kv_heads=meta["num_kv_heads"],
                 head_dim=meta["head_dim"],
                 metric=self.metric,
-                n_trees=self.n_trees,
-                depth=self.depth,
+                ann_mode=self.ann_mode,
+                ivf_num_lists=self.ivf_num_lists,
+                ivf_num_probe=self.ivf_num_probe,
+                ivf_max_iters=self.ivf_max_iters,
                 topk=self.topk,
             )
             layer_state[seq_id] = state

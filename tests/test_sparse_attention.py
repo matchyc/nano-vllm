@@ -1,4 +1,3 @@
-import os
 import unittest
 
 import numpy as np
@@ -7,24 +6,32 @@ try:
 except ImportError:  # pragma: no cover
     torch = None
 
-# Force naive index for deterministic CPU tests
-os.environ["NANOVLLM_FORCE_NAIVE_MLANN"] = "1"
-
-from nanovllm.sparse.mlann_index import MLANNIndex
+from nanovllm.sparse.ann_index import ANNIndex
 if torch is not None:
     from nanovllm.sparse.ops import dense_attention_reference, sparse_subset_attention
 
 
-@unittest.skipUnless(torch is not None, "PyTorch is required for sparse attention tests")
-class SparseAttentionTests(unittest.TestCase):
+class ANNIndexTests(unittest.TestCase):
 
-    def test_mlann_index_shapes(self):
+    def test_ann_index_exact_shapes(self):
         corpus = np.random.randn(32, 16).astype(np.float32)
-        index = MLANNIndex(metric="ip")
+        index = ANNIndex(metric="ip", mode="exact")
         index.build(corpus)
         queries = np.random.randn(3, 16).astype(np.float32)
         out = index.query(queries, k=10)
         self.assertEqual(out.shape, (3, 10))
+
+    def test_ann_index_ivf_mode(self):
+        corpus = np.random.randn(128, 8).astype(np.float32)
+        index = ANNIndex(metric="l2", mode="ivf", ivf_num_lists=16, ivf_num_probe=3)
+        index.build(corpus)
+        queries = np.random.randn(2, 8).astype(np.float32)
+        out = index.query(queries, k=7)
+        self.assertEqual(out.shape, (2, 7))
+
+
+@unittest.skipUnless(torch is not None, "PyTorch is required for sparse attention tests")
+class SparseAttentionTests(unittest.TestCase):
 
     def test_sparse_matches_dense_when_topk_covers_context(self):
         torch.manual_seed(0)
@@ -39,7 +46,7 @@ class SparseAttentionTests(unittest.TestCase):
         v = torch.randn_like(k)
 
         corpus = k.reshape(seq_len, -1).numpy().astype(np.float32)
-        index = MLANNIndex(metric="ip")
+        index = ANNIndex(metric="ip", mode="exact")
         index.build(corpus)
         neighbors = index.query(q.reshape(1, -1).numpy().astype(np.float32), k=seq_len)[0]
         slots = torch.arange(seq_len, dtype=torch.int64)
