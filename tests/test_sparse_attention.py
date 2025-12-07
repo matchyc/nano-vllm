@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Unit tests for sparse attention implementation.
+Unit tests for sparse attention implementation with MLANN.
 
 Tests:
-1. ANNIndex correctness (exact mode)
-2. ANNIndex recall (IVF mode)
+1. MLANNIndex correctness and structure
+2. MLANNIndex recall with different parameters
 3. SparseAttentionManager index building
 4. Config validation
 5. (Optional, requires GPU) Full integration test with toy model
@@ -22,21 +22,21 @@ try:
 except ImportError:
     pytest = None
 
-from nanovllm.sparse.ann_index import ANNIndex
+from nanovllm.sparse.mlann_index import MLANNIndex, compute_recall
 from nanovllm.sparse.manager import SparseAttentionManager
 
 
-class TestANNIndex:
-    """Tests for the ANNIndex class."""
+class TestMLANNIndex:
+    """Tests for the MLANNIndex class (MLANN algorithm implementation)."""
     
-    def test_exact_ip_basic(self):
-        """Test exact inner product search."""
+    def test_basic_build_query(self):
+        """Test basic MLANN index build and query."""
         np.random.seed(42)
         corpus = np.random.randn(100, 32).astype(np.float32)
         queries = np.random.randn(5, 32).astype(np.float32)
         k = 10
         
-        index = ANNIndex(metric="ip", mode="exact")
+        index = MLANNIndex(metric="ip", k_train=16, n_trees=4, max_depth=6)
         index.build(corpus)
         indices = index.query(queries, k)
         
@@ -46,58 +46,66 @@ class TestANNIndex:
         # Verify indices are valid
         assert indices.min() >= 0
         assert indices.max() < 100
-        
-        # Verify correctness against manual computation
-        for i in range(len(queries)):
-            scores = np.dot(queries[i], corpus.T)
-            expected_indices = np.argsort(-scores)[:k]
-            np.testing.assert_array_equal(indices[i], expected_indices)
     
-    def test_exact_l2_basic(self):
-        """Test exact L2 distance search."""
+    def test_same_distribution_recall(self):
+        """Test MLANN achieves good recall when queries are from corpus."""
+        np.random.seed(42)
+        corpus = np.random.randn(200, 64).astype(np.float32)
+        # Normalize for inner product
+        corpus = corpus / (np.linalg.norm(corpus, axis=1, keepdims=True) + 1e-10)
+        
+        # Use subset of corpus as queries (best case for MLANN)
+        queries = corpus[:20]
+        k = 16
+        
+        index = MLANNIndex(metric="ip", k_train=32, n_trees=16, max_depth=8)
+        index.build(corpus)
+        mlann_indices = index.query(queries, k)
+        
+        # Ground truth
+        gt_indices = np.argsort(-(queries @ corpus.T), axis=1)[:, :k]
+        
+        # MLANN should achieve reasonable recall for same-distribution queries
+        recall = compute_recall(mlann_indices, gt_indices)
+        assert recall >= 0.3, f"Same-distribution recall too low: {recall:.2%}"
+    
+    def test_multi_tree_ensemble(self):
+        """Test that more trees improves recall."""
+        np.random.seed(42)
+        corpus = np.random.randn(500, 64).astype(np.float32)
+        corpus = corpus / (np.linalg.norm(corpus, axis=1, keepdims=True) + 1e-10)
+        queries = corpus[:30]
+        k = 16
+        
+        gt_indices = np.argsort(-(queries @ corpus.T), axis=1)[:, :k]
+        
+        recalls = []
+        for n_trees in [1, 4, 8, 16]:
+            index = MLANNIndex(metric="ip", k_train=32, n_trees=n_trees, max_depth=8)
+            index.build(corpus)
+            mlann_indices = index.query(queries, k)
+            recall = compute_recall(mlann_indices, gt_indices)
+            recalls.append(recall)
+        
+        # More trees should generally improve or maintain recall
+        # (with some variance due to randomness)
+        assert recalls[-1] >= recalls[0] * 0.8, "More trees should not significantly hurt recall"
+    
+    def test_l2_metric(self):
+        """Test MLANN with L2 distance metric."""
         np.random.seed(42)
         corpus = np.random.randn(100, 32).astype(np.float32)
-        queries = np.random.randn(5, 32).astype(np.float32)
+        queries = corpus[:10]
         k = 10
         
-        index = ANNIndex(metric="l2", mode="exact")
+        index = MLANNIndex(metric="l2", k_train=16, n_trees=8, max_depth=6)
         index.build(corpus)
         indices = index.query(queries, k)
         
-        # Verify correctness against manual computation
-        for i in range(len(queries)):
-            dists = np.sum((queries[i] - corpus) ** 2, axis=1)
-            expected_indices = np.argsort(dists)[:k]
-            np.testing.assert_array_equal(indices[i], expected_indices)
-    
-    def test_ivf_recall(self):
-        """Test IVF mode achieves reasonable recall."""
-        np.random.seed(42)
-        corpus = np.random.randn(1000, 64).astype(np.float32)
-        queries = np.random.randn(10, 64).astype(np.float32)
-        k = 16
-        
-        # Exact index for ground truth
-        exact_index = ANNIndex(metric="ip", mode="exact")
-        exact_index.build(corpus)
-        exact_indices = exact_index.query(queries, k)
-        
-        # IVF index
-        ivf_index = ANNIndex(metric="ip", mode="ivf", nlist=32, nprobe=8)
-        ivf_index.build(corpus)
-        ivf_indices = ivf_index.query(queries, k)
-        
-        # Compute recall
-        recalls = []
-        for i in range(len(queries)):
-            gt = set(exact_indices[i].tolist())
-            pred = set(ivf_indices[i].tolist())
-            recall = len(gt & pred) / k
-            recalls.append(recall)
-        
-        avg_recall = np.mean(recalls)
-        # IVF should achieve at least 30% recall with these settings
-        assert avg_recall >= 0.3, f"IVF recall too low: {avg_recall:.2%}"
+        # Verify shape and validity
+        assert indices.shape == (10, k)
+        assert indices.min() >= 0
+        assert indices.max() < 100
     
     def test_small_corpus(self):
         """Test with corpus smaller than k."""
@@ -106,7 +114,7 @@ class TestANNIndex:
         queries = np.random.randn(3, 16).astype(np.float32)
         k = 10  # Larger than corpus size
         
-        index = ANNIndex(metric="ip", mode="exact")
+        index = MLANNIndex(metric="ip", k_train=3, n_trees=2, max_depth=4, min_leaf_size=1)
         index.build(corpus)
         indices = index.query(queries, k)
         
@@ -114,39 +122,64 @@ class TestANNIndex:
         assert indices.shape == (3, 5)
     
     def test_index_stats(self):
-        """Test index statistics."""
+        """Test MLANN index statistics."""
         np.random.seed(42)
         corpus = np.random.randn(500, 64).astype(np.float32)
         
-        index = ANNIndex(metric="ip", mode="exact")
+        index = MLANNIndex(metric="ip", k_train=20, n_trees=8, max_depth=6)
         index.build(corpus)
         
         stats = index.get_stats()
-        assert stats["num_vectors"] == 500
-        assert stats["dim"] == 64
+        assert stats["num_corpus"] == 500
+        assert stats["k_train"] == 20
+        assert stats["n_trees"] == 8
         assert stats["metric"] == "ip"
-        assert stats["mode"] == "exact"
         assert stats["build_time_ms"] >= 0
+        assert stats["total_cells"] > 0
+    
+    def test_query_with_scores(self):
+        """Test query_with_scores returns valid scores."""
+        np.random.seed(42)
+        corpus = np.random.randn(100, 32).astype(np.float32)
+        queries = np.random.randn(5, 32).astype(np.float32)
+        k = 10
+        
+        index = MLANNIndex(metric="ip", k_train=16, n_trees=4, max_depth=6)
+        index.build(corpus)
+        indices, scores = index.query_with_scores(queries, k)
+        
+        # Verify shapes
+        assert indices.shape == (5, k)
+        assert scores.shape == (5, k)
+        
+        # Scores should be non-negative (probabilities)
+        assert scores.min() >= 0
+        
+        # Scores should be sorted descending
+        for i in range(5):
+            assert np.all(scores[i, :-1] >= scores[i, 1:])
 
 
 class TestSparseAttentionManager:
-    """Tests for the SparseAttentionManager class."""
+    """Tests for the SparseAttentionManager class with MLANN."""
     
     def mock_config(self):
-        """Create a mock config for testing."""
+        """Create a mock config for testing with MLANN settings."""
         class MockConfig:
             use_sparse_attention = True
             sparse_topk = 16
             sparse_min_seq_len = 32
             sparse_distance_metric = "ip"
             sparse_index_granularity = "layer_shared"
-            sparse_ann_mode = "exact"
-            sparse_ivf_nlist = 32
-            sparse_ivf_nprobe = 4
             sparse_include_decode_dense = True
             sparse_max_decode_tokens = 8
             sparse_debug = False
             kvcache_block_size = 16
+            # MLANN-specific
+            sparse_mlann_k_train = 16
+            sparse_mlann_n_trees = 4
+            sparse_mlann_max_depth = 6
+            sparse_mlann_min_leaf_size = 5
         return MockConfig()
     
     def test_manager_init(self, mock_config):
@@ -163,6 +196,7 @@ class TestSparseAttentionManager:
         assert manager.head_dim == 32
         assert manager.enabled == True
         assert manager.topk == 16
+        assert manager.mlann_n_trees == 4
     
     def test_index_dim(self, mock_config):
         """Test index dimension calculation."""
@@ -173,13 +207,14 @@ class TestSparseAttentionManager:
             sparse_min_seq_len = 32
             sparse_distance_metric = "ip"
             sparse_index_granularity = "layer_shared"
-            sparse_ann_mode = "exact"
-            sparse_ivf_nlist = 32
-            sparse_ivf_nprobe = 4
             sparse_include_decode_dense = True
             sparse_max_decode_tokens = 8
             sparse_debug = False
             kvcache_block_size = 16
+            sparse_mlann_k_train = 16
+            sparse_mlann_n_trees = 4
+            sparse_mlann_max_depth = 6
+            sparse_mlann_min_leaf_size = 5
         
         class PerHeadConfig:
             use_sparse_attention = True
@@ -187,13 +222,14 @@ class TestSparseAttentionManager:
             sparse_min_seq_len = 32
             sparse_distance_metric = "ip"
             sparse_index_granularity = "per_head"
-            sparse_ann_mode = "exact"
-            sparse_ivf_nlist = 32
-            sparse_ivf_nprobe = 4
             sparse_include_decode_dense = True
             sparse_max_decode_tokens = 8
             sparse_debug = False
             kvcache_block_size = 16
+            sparse_mlann_k_train = 16
+            sparse_mlann_n_trees = 4
+            sparse_mlann_max_depth = 6
+            sparse_mlann_min_leaf_size = 5
         
         # Layer shared: num_kv_heads * head_dim
         manager = SparseAttentionManager(LayerSharedConfig(), 4, 8, 64)
@@ -212,7 +248,7 @@ class TestSparseAttentionManager:
         assert manager.is_sparse_eligible(1000) == True
     
     def test_build_indices(self, mock_config):
-        """Test index building from mock KV cache."""
+        """Test MLANN index building from mock KV cache."""
         manager = SparseAttentionManager(
             config=mock_config,
             num_layers=4,
@@ -235,9 +271,15 @@ class TestSparseAttentionManager:
         # Should have built indices for all layers
         assert len(build_times) == 4
         assert all(layer_id in manager.indices for layer_id in range(4))
+        
+        # Verify MLANN structure
+        for layer_id in range(4):
+            index = manager.indices[layer_id]
+            assert index.is_built
+            assert len(index.partitioners) == 4  # n_trees
     
     def test_query_indices(self, mock_config):
-        """Test querying indices."""
+        """Test querying MLANN indices."""
         manager = SparseAttentionManager(
             config=mock_config,
             num_layers=4,
@@ -290,47 +332,51 @@ class TestConfig:
     
     def test_default_config_no_sparse(self):
         """Test that default config has sparse attention disabled."""
-        # We can't easily test the actual Config class without model path
-        # Just verify the expected defaults
         expected_defaults = {
             'use_sparse_attention': False,
             'sparse_topk': 64,
             'sparse_min_seq_len': 512,
             'sparse_distance_metric': 'ip',
             'sparse_index_granularity': 'layer_shared',
-            'sparse_ann_mode': 'exact',
+            'sparse_mlann_n_trees': 8,
         }
-        # This is more of a documentation test
         assert expected_defaults['use_sparse_attention'] == False
 
 
 def run_tests():
     """Run all tests."""
-    print("Running sparse attention unit tests...")
+    print("Running sparse attention unit tests (MLANN)...")
     print("=" * 60)
     
-    # ANNIndex tests
-    print("\n1. ANNIndex Tests")
+    # MLANNIndex tests
+    print("\n1. MLANNIndex Tests")
     print("-" * 40)
     
-    test_ann = TestANNIndex()
-    test_ann.test_exact_ip_basic()
-    print("   ✓ test_exact_ip_basic")
+    test_mlann = TestMLANNIndex()
     
-    test_ann.test_exact_l2_basic()
-    print("   ✓ test_exact_l2_basic")
+    test_mlann.test_basic_build_query()
+    print("   ✓ test_basic_build_query")
     
-    test_ann.test_ivf_recall()
-    print("   ✓ test_ivf_recall")
+    test_mlann.test_same_distribution_recall()
+    print("   ✓ test_same_distribution_recall")
     
-    test_ann.test_small_corpus()
+    test_mlann.test_multi_tree_ensemble()
+    print("   ✓ test_multi_tree_ensemble")
+    
+    test_mlann.test_l2_metric()
+    print("   ✓ test_l2_metric")
+    
+    test_mlann.test_small_corpus()
     print("   ✓ test_small_corpus")
     
-    test_ann.test_index_stats()
+    test_mlann.test_index_stats()
     print("   ✓ test_index_stats")
     
+    test_mlann.test_query_with_scores()
+    print("   ✓ test_query_with_scores")
+    
     # SparseAttentionManager tests
-    print("\n2. SparseAttentionManager Tests")
+    print("\n2. SparseAttentionManager Tests (with MLANN)")
     print("-" * 40)
     
     class MockConfig:
@@ -339,13 +385,14 @@ def run_tests():
         sparse_min_seq_len = 32
         sparse_distance_metric = "ip"
         sparse_index_granularity = "layer_shared"
-        sparse_ann_mode = "exact"
-        sparse_ivf_nlist = 32
-        sparse_ivf_nprobe = 4
         sparse_include_decode_dense = True
         sparse_max_decode_tokens = 8
         sparse_debug = False
         kvcache_block_size = 16
+        sparse_mlann_k_train = 16
+        sparse_mlann_n_trees = 4
+        sparse_mlann_max_depth = 6
+        sparse_mlann_min_leaf_size = 5
     
     mock_config = MockConfig()
     test_manager = TestSparseAttentionManager()

@@ -24,17 +24,11 @@ class Config:
     sparse_topk: int = 64
     # Minimum sequence length to enable sparse attention (fallback to dense below this)
     sparse_min_seq_len: int = 512
-    # Distance metric for ANN: "ip" (inner product) or "l2" (Euclidean distance)
+    # Distance metric for MLANN: "ip" (inner product) or "l2" (Euclidean distance)
     sparse_distance_metric: str = "ip"
     # Index granularity: "layer_shared" (one index per layer, all heads share)
     #                    "per_head" (one index per head) - partially implemented
     sparse_index_granularity: str = "layer_shared"
-    # ANN mode: "exact" (brute-force kNN) or "ivf" (approximate IVF-style)
-    sparse_ann_mode: str = "exact"
-    # Number of clusters for IVF mode (only used when sparse_ann_mode="ivf")
-    sparse_ivf_nlist: int = 64
-    # Number of clusters to probe in IVF mode
-    sparse_ivf_nprobe: int = 8
     # Whether to include decode tokens in attention (dense) alongside sparse prefill
     # If True: sparse over prefill + dense over recent decode tokens
     # If False: sparse over prefill only (simpler, use for short decode)
@@ -43,6 +37,22 @@ class Config:
     sparse_max_decode_tokens: int = 64
     # Enable debug logging for sparse attention
     sparse_debug: bool = False
+    
+    # ============ MLANN Algorithm Configuration ============
+    # MLANN uses multilabel classification for ANN candidate selection
+    # (see "A Multilabel Classification Framework for Approximate Nearest Neighbor Search")
+    
+    # k_train: Number of neighbors for computing training labels (k-NN ground truth)
+    # Larger k_train captures more potential neighbors but increases build cost
+    sparse_mlann_k_train: int = 32
+    # n_trees: Number of RP trees in the ensemble (random forest style)
+    # More trees = better recall but slower build/query
+    sparse_mlann_n_trees: int = 8
+    # max_depth: Maximum depth of each RP tree
+    # Deeper trees = more cells = finer partitioning
+    sparse_mlann_max_depth: int = 8
+    # min_leaf_size: Minimum points in a leaf node before stopping splits
+    sparse_mlann_min_leaf_size: int = 10
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -60,8 +70,8 @@ class Config:
                 "sparse_distance_metric must be 'ip' or 'l2'"
             assert self.sparse_index_granularity in ("layer_shared", "per_head"), \
                 "sparse_index_granularity must be 'layer_shared' or 'per_head'"
-            assert self.sparse_ann_mode in ("exact", "ivf"), \
-                "sparse_ann_mode must be 'exact' or 'ivf'"
-            if self.sparse_ann_mode == "ivf":
-                assert self.sparse_ivf_nlist > 0, "sparse_ivf_nlist must be positive"
-                assert self.sparse_ivf_nprobe > 0, "sparse_ivf_nprobe must be positive"
+            # MLANN config validation
+            assert self.sparse_mlann_k_train > 0, "sparse_mlann_k_train must be positive"
+            assert self.sparse_mlann_n_trees > 0, "sparse_mlann_n_trees must be positive"
+            assert self.sparse_mlann_max_depth > 0, "sparse_mlann_max_depth must be positive"
+            assert self.sparse_mlann_min_leaf_size > 0, "sparse_mlann_min_leaf_size must be positive"

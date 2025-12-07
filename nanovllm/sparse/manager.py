@@ -1,14 +1,19 @@
 """
 Sparse Attention Manager for nano-vllm.
 
-This module manages per-layer ANN indices for sparse attention:
-- Builds indices from prefill keys
-- Queries indices during decode
+This module manages per-layer MLANN indices for sparse attention:
+- Builds MLANN indices from prefill keys using the natural classifier formulation
+- Queries indices during decode to find top-k relevant keys
 - Handles device transfers (GPU <-> CPU) and shape transformations
 
 The manager supports two granularity modes:
 - "layer_shared": One index per layer, all heads share (flatten num_kv_heads * head_dim)
 - "per_head": One index per head (TODO: partially implemented)
+
+MLANN (Multilabel ANN) treats candidate selection as a multilabel classification:
+- Training: For each corpus vector, compute its k-NN and use as labels
+- Build a partitioner (RP tree ensemble) and estimate per-cell label probabilities
+- Query: Route query to cells, aggregate probabilities, return top-k candidates
 
 Usage:
     # Initialize (typically in ModelRunner)
@@ -28,7 +33,7 @@ from typing import Optional, List, Dict, Tuple
 import time
 import logging
 
-from nanovllm.sparse.ann_index import ANNIndex
+from nanovllm.sparse.mlann_index import MLANNIndex
 
 
 logger = logging.getLogger(__name__)
@@ -36,7 +41,13 @@ logger = logging.getLogger(__name__)
 
 class SparseAttentionManager:
     """
-    Manages ANN indices for sparse attention across all layers.
+    Manages MLANN indices for sparse attention across all layers.
+    
+    Uses the MLANN algorithm (Multilabel Classification for ANN) which:
+    - Treats candidate selection as multilabel classification
+    - Builds random projection tree ensemble for space partitioning
+    - Estimates per-cell label probabilities during training
+    - Aggregates scores across trees during query
     
     Attributes:
         config: The nano-vllm Config object
@@ -44,7 +55,7 @@ class SparseAttentionManager:
         num_kv_heads: Number of key-value heads (per GPU in tensor parallel)
         head_dim: Dimension of each head
         granularity: "layer_shared" or "per_head"
-        indices: Dict mapping layer_id -> ANNIndex (or list of ANNIndex for per_head)
+        indices: Dict mapping layer_id -> MLANNIndex (or list of MLANNIndex for per_head)
     """
     
     def __init__(
@@ -74,17 +85,20 @@ class SparseAttentionManager:
         self.min_seq_len = config.sparse_min_seq_len
         self.metric = config.sparse_distance_metric
         self.granularity = config.sparse_index_granularity
-        self.ann_mode = config.sparse_ann_mode
-        self.ivf_nlist = config.sparse_ivf_nlist
-        self.ivf_nprobe = config.sparse_ivf_nprobe
         self.include_decode_dense = config.sparse_include_decode_dense
         self.max_decode_tokens = config.sparse_max_decode_tokens
         self.debug = config.sparse_debug
         
+        # MLANN-specific config
+        self.mlann_k_train = getattr(config, 'sparse_mlann_k_train', 32)
+        self.mlann_n_trees = getattr(config, 'sparse_mlann_n_trees', 8)
+        self.mlann_max_depth = getattr(config, 'sparse_mlann_max_depth', 8)
+        self.mlann_min_leaf_size = getattr(config, 'sparse_mlann_min_leaf_size', 10)
+        
         # Per-layer indices
-        # For "layer_shared": indices[layer_id] = ANNIndex
-        # For "per_head": indices[layer_id] = [ANNIndex] * num_kv_heads
-        self.indices: Dict[int, ANNIndex | List[ANNIndex]] = {}
+        # For "layer_shared": indices[layer_id] = MLANNIndex
+        # For "per_head": indices[layer_id] = [MLANNIndex] * num_kv_heads
+        self.indices: Dict[int, MLANNIndex | List[MLANNIndex]] = {}
         
         # Sequence info for each active sequence
         # Maps seq_id -> {prefill_len, block_table, ...}
@@ -115,13 +129,14 @@ class SparseAttentionManager:
         self.indices.clear()
         self.seq_info.clear()
     
-    def _create_index(self) -> ANNIndex:
-        """Create a new ANNIndex with current config."""
-        return ANNIndex(
+    def _create_index(self) -> MLANNIndex:
+        """Create a new MLANNIndex with current config."""
+        return MLANNIndex(
             metric=self.metric,
-            mode=self.ann_mode,
-            nlist=self.ivf_nlist,
-            nprobe=self.ivf_nprobe,
+            k_train=self.mlann_k_train,
+            n_trees=self.mlann_n_trees,
+            max_depth=self.mlann_max_depth,
+            min_leaf_size=self.mlann_min_leaf_size,
         )
     
     def build_index_for_layer(
@@ -130,7 +145,13 @@ class SparseAttentionManager:
         keys: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim] on GPU
     ) -> float:
         """
-        Build ANN index for a single layer from prefill keys.
+        Build MLANN index for a single layer from prefill keys.
+        
+        The MLANN algorithm:
+        1. Use keys as both corpus and training queries
+        2. Compute exact k-NN for each training query (ground truth labels)
+        3. Build RP tree ensemble partitioner
+        4. Estimate per-cell label probabilities p(r, j)
         
         Args:
             layer_id: The layer index
@@ -150,9 +171,14 @@ class SparseAttentionManager:
             # Transfer to CPU and convert to numpy
             keys_np = keys_flat.float().cpu().numpy()
             
-            # Create and build index
+            # Create and build MLANN index
+            # Uses keys as both corpus and training queries
+            # MLANN will:
+            # 1. Compute exact k-NN for each key (training labels)
+            # 2. Build RP tree ensemble
+            # 3. Estimate per-cell label probabilities
             index = self._create_index()
-            index.build(keys_np)
+            index.build(corpus=keys_np, train_queries=None, train_knn_indices=None)
             self.indices[layer_id] = index
             
         else:  # per_head
@@ -163,7 +189,7 @@ class SparseAttentionManager:
                 keys_np = keys_h.float().cpu().numpy()
                 
                 index = self._create_index()
-                index.build(keys_np)
+                index.build(corpus=keys_np)
                 head_indices.append(index)
             
             self.indices[layer_id] = head_indices
@@ -173,7 +199,14 @@ class SparseAttentionManager:
         self.stats["num_index_builds"] += 1
         
         if self.debug:
-            logger.info(f"Layer {layer_id} index built: {num_tokens} tokens, {build_time:.2f} ms")
+            if self.granularity == "layer_shared":
+                stats = self.indices[layer_id].get_stats()
+                logger.info(f"Layer {layer_id} MLANN index built: {num_tokens} tokens, "
+                           f"{stats['n_trees']} trees, {stats['total_cells']} cells, "
+                           f"{build_time:.2f} ms")
+            else:
+                logger.info(f"Layer {layer_id} MLANN index built: {num_tokens} tokens, "
+                           f"{build_time:.2f} ms")
         
         return build_time
     
@@ -456,22 +489,25 @@ class SparseAttentionManager:
 
 
 def test_sparse_attention_manager():
-    """Test the SparseAttentionManager."""
+    """Test the SparseAttentionManager with MLANN."""
     import torch
     
-    # Mock config
+    # Mock config with MLANN settings
     class MockConfig:
         use_sparse_attention = True
         sparse_topk = 16
         sparse_min_seq_len = 32
         sparse_distance_metric = "ip"
         sparse_index_granularity = "layer_shared"
-        sparse_ann_mode = "exact"
-        sparse_ivf_nlist = 32
-        sparse_ivf_nprobe = 4
         sparse_include_decode_dense = True
         sparse_max_decode_tokens = 8
         sparse_debug = True
+        kvcache_block_size = 16
+        # MLANN-specific
+        sparse_mlann_k_train = 16
+        sparse_mlann_n_trees = 4
+        sparse_mlann_max_depth = 6
+        sparse_mlann_min_leaf_size = 5
     
     config = MockConfig()
     num_layers = 4
@@ -490,17 +526,24 @@ def test_sparse_attention_manager():
     seq_len = 64  # Use 4 blocks
     block_table = [0, 1, 2, 3]
     
-    print("Testing SparseAttentionManager...")
+    print("Testing SparseAttentionManager with MLANN...")
     
     # Build indices
-    print("\n1. Building indices from KV cache...")
+    print("\n1. Building MLANN indices from KV cache...")
     build_times = manager.build_indices_from_kv_cache(
         kv_cache, [seq_len], [block_table], block_size
     )
-    print(f"   Build times: {build_times}")
+    print(f"   Build times per layer: {build_times}")
+    
+    # Verify MLANN structure
+    print("\n2. Verifying MLANN index structure...")
+    for layer_id in range(num_layers):
+        index = manager.indices[layer_id]
+        stats = index.get_stats()
+        print(f"   Layer {layer_id}: {stats['n_trees']} trees, {stats['total_cells']} cells")
     
     # Query indices
-    print("\n2. Querying indices...")
+    print("\n3. Querying indices...")
     num_queries = 4
     num_heads = 8  # GQA: 8 query heads, 4 KV heads
     queries = torch.randn(num_queries, num_heads, head_dim)
@@ -512,10 +555,22 @@ def test_sparse_attention_manager():
         print(f"   Layer {layer_id}: sparse_indices shape = {sparse_indices.shape}, decode_range = {decode_range}")
     
     # Get stats
-    print("\n3. Manager stats:")
+    print("\n4. Manager stats:")
     stats = manager.get_stats()
     for k, v in stats.items():
         print(f"   {k}: {v}")
+    
+    # Test with queries from same distribution as keys (best case for MLANN)
+    print("\n5. Testing with same-distribution queries...")
+    # Extract some keys to use as queries
+    layer_0_keys = manager._gather_keys_from_cache(
+        kv_cache[0, 0], block_table, seq_len, block_size
+    )
+    same_dist_queries = layer_0_keys[:4]  # Use first 4 keys as queries
+    
+    indices = manager.query(0, same_dist_queries)
+    print(f"   Same-distribution query result shape: {indices.shape}")
+    print(f"   Top-3 indices for query 0: {indices[0, :3].tolist()}")
     
     print("\nAll tests passed!")
 

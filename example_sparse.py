@@ -122,10 +122,14 @@ def main():
         sparse_min_seq_len=args.sparse_min_seq,
         sparse_distance_metric="ip",
         sparse_index_granularity="layer_shared",
-        sparse_ann_mode="exact",
         sparse_include_decode_dense=True,
         sparse_max_decode_tokens=32,
         sparse_debug=True,
+        # MLANN algorithm parameters
+        sparse_mlann_k_train=32,    # k-NN for training labels
+        sparse_mlann_n_trees=8,     # Number of RP trees
+        sparse_mlann_max_depth=8,   # Max tree depth
+        sparse_mlann_min_leaf_size=10,
     )
     
     start = time.perf_counter()
