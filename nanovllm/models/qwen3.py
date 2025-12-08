@@ -4,11 +4,12 @@ import torch.distributed as dist
 from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
-from nanovllm.layers.attention import Attention
+from nanovllm.layers.attention import Attention, reset_sparse_layer_counter
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.utils.context import get_context
 
 
 class Qwen3Attention(nn.Module):
@@ -174,6 +175,14 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        # Reset sparse layer counter at the start of each forward pass
+        # This ensures layer IDs are assigned correctly during:
+        # - Prefill: for storing Q vectors per layer (for MLANN training)
+        # - Decode: for querying correct layer's MLANN index
+        context = get_context()
+        if context.sparse is not None and (context.sparse.enabled or context.sparse.manager is not None):
+            reset_sparse_layer_counter()
+        
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:

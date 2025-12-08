@@ -1,15 +1,20 @@
 import pickle
+import time
+import logging
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+from typing import Optional, List, Dict
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.context import set_context, get_context, reset_context, SparseAttentionContext
 from nanovllm.utils.loader import load_model
+
+logger = logging.getLogger(__name__)
 
 
 class ModelRunner:
@@ -37,6 +42,11 @@ class ModelRunner:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+        
+        # Initialize sparse attention manager if enabled
+        self.sparse_manager: Optional['SparseAttentionManager'] = None
+        if config.use_sparse_attention:
+            self._init_sparse_attention(hf_config)
 
         if self.world_size > 1:
             if rank == 0:
@@ -46,6 +56,29 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
+    
+    def _init_sparse_attention(self, hf_config):
+        """Initialize sparse attention manager."""
+        from nanovllm.sparse.manager import SparseAttentionManager
+        
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        
+        self.sparse_manager = SparseAttentionManager(
+            config=self.config,
+            num_layers=hf_config.num_hidden_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+        )
+        
+        if self.config.sparse_debug:
+            logger.info(f"Sparse attention manager initialized: "
+                       f"num_layers={hf_config.num_hidden_layers}, "
+                       f"num_kv_heads={num_kv_heads}, head_dim={head_dim}")
+        
+        # Store info needed for sparse attention
+        self._sparse_prefill_seqs: List[Sequence] = []
+        self._sparse_active: bool = False
 
     def exit(self):
         if self.world_size > 1:
@@ -158,7 +191,24 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        
+        # Prepare sparse attention context for prefill (needed to collect Q vectors)
+        # In MLANN: Q queries K, so we need Q as training queries
+        sparse_ctx = None
+        if self.sparse_manager is not None:
+            # Check if sequence is eligible for sparse attention
+            max_seq_len = max(len(seq) for seq in seqs)
+            if self.sparse_manager.is_sparse_eligible(max_seq_len):
+                sparse_ctx = SparseAttentionContext(
+                    enabled=False,  # Not enabled for attention yet, just for collecting Q
+                    sparse_indices={},
+                    decode_range=None,
+                    prefill_len=max_seq_len,
+                    current_seq_len=max_seq_len,
+                    manager=self.sparse_manager,
+                )
+        
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, sparse=sparse_ctx)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -176,7 +226,11 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        
+        # Prepare sparse attention context if applicable
+        sparse_ctx = self._prepare_sparse_context(seqs) if self.sparse_manager is not None else None
+        
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, sparse=sparse_ctx)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -210,8 +264,106 @@ class ModelRunner:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        
+        # Build sparse attention indices after prefill
+        # TODO: For overlap, this could be done asynchronously during later layer computation
+        # Currently synchronous for simplicity
+        if is_prefill and self.sparse_manager is not None:
+            self._build_sparse_indices_after_prefill(seqs)
+        
         reset_context()
         return token_ids
+    
+    def _build_sparse_indices_after_prefill(self, seqs: List[Sequence]):
+        """
+        Build ANN indices for sparse attention after prefill completes.
+        
+        This extracts keys from the KV cache and builds per-layer indices.
+        For v1, this is synchronous. Future versions could overlap with decode.
+        
+        TODO: For overlap optimization, we could:
+        1. Start building layer L's index as soon as its prefill completes
+        2. Use a background thread/CUDA stream for index building
+        3. Have decode attention wait only if its layer's index isn't ready
+        """
+        # Check if any sequence is eligible for sparse attention
+        max_seq_len = max(len(seq) for seq in seqs)
+        if not self.sparse_manager.is_sparse_eligible(max_seq_len):
+            self._sparse_active = False
+            if self.config.sparse_debug:
+                logger.info(f"Sparse attention not active: max_seq_len={max_seq_len} < threshold={self.config.sparse_min_seq_len}")
+            return
+        
+        # Currently only support single sequence for sparse attention
+        # TODO: Extend to batched sparse attention
+        if len(seqs) > 1:
+            if self.config.sparse_debug:
+                logger.warning("Sparse attention currently only supports single sequence batches")
+            self._sparse_active = False
+            return
+        
+        seq = seqs[0]
+        seq_len = len(seq)
+        block_table = seq.block_table
+        
+        if self.config.sparse_debug:
+            start_time = time.perf_counter()
+        
+        # Build indices from KV cache
+        build_times = self.sparse_manager.build_indices_from_kv_cache(
+            self.kv_cache,
+            [seq_len],
+            [block_table],
+            self.block_size,
+        )
+        
+        if self.config.sparse_debug:
+            total_time = (time.perf_counter() - start_time) * 1000
+            logger.info(f"Sparse indices built: seq_len={seq_len}, total_time={total_time:.2f}ms")
+            for layer_id, t in build_times.items():
+                logger.info(f"  Layer {layer_id}: {t:.2f}ms")
+        
+        self._sparse_prefill_seqs = seqs
+        self._sparse_active = True
+    
+    def _prepare_sparse_context(self, seqs: List[Sequence]) -> Optional[SparseAttentionContext]:
+        """
+        Prepare sparse attention context for decode.
+        
+        Returns None if sparse attention should not be used for this decode step.
+        """
+        if not self._sparse_active or self.sparse_manager is None:
+            return None
+        
+        # Currently only support single sequence
+        if len(seqs) != 1:
+            return None
+        
+        seq = seqs[0]
+        current_seq_len = len(seq)
+        
+        # Get prefill length from manager
+        if 0 not in self.sparse_manager.seq_info:
+            return None
+        
+        prefill_len = self.sparse_manager.seq_info[0]["prefill_len"]
+        
+        # Determine decode range for dense attention
+        decode_range = None
+        if self.config.sparse_include_decode_dense:
+            num_decode_tokens = current_seq_len - prefill_len
+            if num_decode_tokens > 0:
+                decode_start = max(prefill_len, current_seq_len - self.config.sparse_max_decode_tokens)
+                decode_range = (decode_start, current_seq_len)
+        
+        return SparseAttentionContext(
+            enabled=True,
+            sparse_indices={},  # Will be populated per-layer during attention
+            decode_range=decode_range,
+            prefill_len=prefill_len,
+            current_seq_len=current_seq_len,
+            manager=self.sparse_manager,
+        )
 
     @torch.inference_mode()
     def capture_cudagraph(self):
