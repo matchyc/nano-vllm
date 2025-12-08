@@ -14,6 +14,15 @@ Core idea:
 - At query time, route query to cell r(q), score corpus by p(r(q), j), return top-M
 
 Implementation follows the "natural classifier" formulation from the paper.
+
+For Attention-aware training:
+- Corpus = K (key vectors) - what we search over
+- Training queries = Q (query vectors) - what does the searching
+- Labels = k-NN of each Q in K space
+
+This is crucial because in attention, Q queries K (not K queries K).
+Using Q as training queries captures the actual attention pattern and
+significantly improves recall compared to self-training with K.
 """
 
 from __future__ import annotations

@@ -191,7 +191,24 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        
+        # Prepare sparse attention context for prefill (needed to collect Q vectors)
+        # In MLANN: Q queries K, so we need Q as training queries
+        sparse_ctx = None
+        if self.sparse_manager is not None:
+            # Check if sequence is eligible for sparse attention
+            max_seq_len = max(len(seq) for seq in seqs)
+            if self.sparse_manager.is_sparse_eligible(max_seq_len):
+                sparse_ctx = SparseAttentionContext(
+                    enabled=False,  # Not enabled for attention yet, just for collecting Q
+                    sparse_indices={},
+                    decode_range=None,
+                    prefill_len=max_seq_len,
+                    current_seq_len=max_seq_len,
+                    manager=self.sparse_manager,
+                )
+        
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, sparse=sparse_ctx)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):

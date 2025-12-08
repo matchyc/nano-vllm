@@ -81,6 +81,12 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
+            # Store Q for MLANN training if sparse attention is enabled
+            # MLANN needs Q vectors as training queries (Q queries K in attention)
+            if context.sparse is not None and context.sparse.manager is not None:
+                layer_id = get_and_increment_sparse_layer_id()
+                context.sparse.manager.store_prefill_query(layer_id, q)
+            
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,

@@ -6,22 +6,25 @@ This module implements a prototype sparse attention mechanism for nano-vllm usin
 
 MLANN treats ANN candidate selection as a **multilabel classification problem**:
 
-1. **Training Phase**:
-   - Corpus vectors: `{c_j}` (key vectors from prefill)
-   - Training queries: `{x_i}` with labels `Y_i = {indices of k-NN of x_i}`
+1. **Training Phase** (Attention-Aware):
+   - **Corpus vectors**: `{K_j}` (key vectors from prefill)
+   - **Training queries**: `{Q_i}` (query vectors from prefill) - **NOT K!**
+   - **Labels**: `Y_i = {indices of k-NN of Q_i in K space}`
    - Build a partitioning structure (RP tree ensemble) that divides the space into cells
+   
+   **Why Q as training queries?** In attention, Q queries K. The MLANN classifier should learn the Q→K attention pattern, not K→K self-similarity.
 
 2. **Natural Classifier**:
-   - For each training query `x_i`, find its partition cell `r(x_i)`
+   - For each training query `Q_i`, find its partition cell `r(Q_i)`
    - For each cell `r` and corpus index `j`, estimate:
      ```
-     p(r, j) = P(j in k-NN of query | query lands in cell r)
-             ≈ (# queries in cell r with j in their k-NN) / (# queries in cell r)
+     p(r, j) = P(K_j in k-NN of Q | Q lands in cell r)
+             ≈ (# Q in cell r with K_j in their k-NN) / (# Q in cell r)
      ```
 
-3. **Query Phase**:
-   - Route query `q` to cell `r(q)` via the same partitioning scheme
-   - Score corpus indices by aggregating `p(r_t(q), j)` across all trees `t`
+3. **Query Phase** (Decode):
+   - Route new query `Q` to cell `r(Q)` via the same partitioning scheme
+   - Score corpus indices by aggregating `p(r_t(Q), j)` across all trees `t`
    - Return top-k indices by score
 
 ## Key Components
@@ -103,9 +106,11 @@ Each tree is built by:
 
 ### Training Label Computation
 
-For each corpus vector `x_i`:
-1. Compute exact k-NN using brute-force (O(n²) for n vectors)
-2. Store indices of k nearest neighbors as labels `Y_i`
+For each query vector `Q_i`:
+1. Compute exact k-NN in K (corpus) using brute-force: find which K vectors are most similar to Q_i
+2. Store indices of k nearest K neighbors as labels `Y_i`
+
+This captures the actual attention pattern: which K tokens does each Q attend to most strongly?
 
 ### Per-Cell Probability Estimation
 

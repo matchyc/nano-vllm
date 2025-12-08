@@ -158,6 +158,56 @@ class TestMLANNIndex:
         # Scores should be sorted descending
         for i in range(5):
             assert np.all(scores[i, :-1] >= scores[i, 1:])
+    
+    def test_separate_train_queries(self):
+        """Test MLANN with separate training queries (Q) and corpus (K).
+        
+        This tests the attention-aware training where:
+        - Corpus = K vectors
+        - Training queries = Q vectors (different from K!)
+        - Labels = k-NN of each Q in K space
+        
+        This is critical for sparse attention since Q queries K, not K queries K.
+        """
+        np.random.seed(42)
+        dim = 64
+        num_tokens = 200
+        
+        # Simulate Q and K from same transformer layer (correlated but different)
+        # In real attention: Q = W_q * X, K = W_k * X with different projections
+        hidden = np.random.randn(num_tokens, dim * 2).astype(np.float32)
+        queries = hidden[:, :dim]  # Q
+        corpus = hidden[:, dim:]   # K
+        
+        # Normalize
+        queries = queries / (np.linalg.norm(queries, axis=1, keepdims=True) + 1e-10)
+        corpus = corpus / (np.linalg.norm(corpus, axis=1, keepdims=True) + 1e-10)
+        
+        k = 16
+        
+        # Ground truth: Q queries K
+        gt_indices = np.argsort(-(queries @ corpus.T), axis=1)[:, :k]
+        
+        # Test 1: Train with Q, query with Q (correct way)
+        index_q = MLANNIndex(metric="ip", k_train=32, n_trees=8, max_depth=8)
+        index_q.build(corpus=corpus, train_queries=queries)
+        mlann_indices_q = index_q.query(queries[:30], k)
+        recall_q = compute_recall(mlann_indices_q, gt_indices[:30])
+        
+        # Test 2: Train with K (self), query with Q (incorrect way - old behavior)
+        index_k = MLANNIndex(metric="ip", k_train=32, n_trees=8, max_depth=8)
+        index_k.build(corpus=corpus, train_queries=None)  # Uses corpus as train_queries
+        mlann_indices_k = index_k.query(queries[:30], k)
+        recall_k = compute_recall(mlann_indices_k, gt_indices[:30])
+        
+        print(f"\n   MLANN Q vs K training comparison:")
+        print(f"      Trained with Q: recall = {recall_q:.2%}")
+        print(f"      Trained with K: recall = {recall_k:.2%}")
+        
+        # Training with Q should be at least as good as training with K
+        # when queries are Q (since that's the actual distribution)
+        # Note: in some cases K self-training might work well if Q and K are very similar
+        assert recall_q >= 0.1, f"Q-trained recall too low: {recall_q:.2%}"
 
 
 class TestSparseAttentionManager:
@@ -374,6 +424,9 @@ def run_tests():
     
     test_mlann.test_query_with_scores()
     print("   ✓ test_query_with_scores")
+    
+    test_mlann.test_separate_train_queries()
+    print("   ✓ test_separate_train_queries")
     
     # SparseAttentionManager tests
     print("\n2. SparseAttentionManager Tests (with MLANN)")

@@ -176,9 +176,11 @@ class Qwen3Model(nn.Module):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         # Reset sparse layer counter at the start of each forward pass
-        # This ensures layer IDs are assigned correctly during decode
+        # This ensures layer IDs are assigned correctly during:
+        # - Prefill: for storing Q vectors per layer (for MLANN training)
+        # - Decode: for querying correct layer's MLANN index
         context = get_context()
-        if not context.is_prefill and context.sparse is not None and context.sparse.enabled:
+        if context.sparse is not None and (context.sparse.enabled or context.sparse.manager is not None):
             reset_sparse_layer_counter()
         
         hidden_states = self.embed_tokens(input_ids)
